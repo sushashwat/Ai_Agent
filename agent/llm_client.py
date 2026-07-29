@@ -1,11 +1,13 @@
 """
 Wrapper around the Google Gemini API (new google-genai SDK) implementing the
 same tool-use loop interface as the original Anthropic client, so core.py /
-main.py don't need any changes.
+main.py don't need any changes. Includes automatic retry on rate limits.
 """
 from __future__ import annotations
 
 import os
+import re
+import time
 from dataclasses import dataclass
 
 from google import genai
@@ -13,7 +15,7 @@ from google.genai import types
 
 from .tools import ToolBox, dispatch
 
-DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
+DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-lite-latest")
 
 
 @dataclass
@@ -46,6 +48,20 @@ class LLMClient:
         ]
         return [types.Tool(function_declarations=declarations)]
 
+    def _send_with_retry(self, chat, message, max_attempts: int = 5):
+        for attempt in range(max_attempts):
+            try:
+                return chat.send_message(message)
+            except Exception as e:  # noqa: BLE001
+                if "RESOURCE_EXHAUSTED" in str(e) or "429" in str(e):
+                    match = re.search(r"retryDelay['\"]?:\s*['\"]?(\d+)", str(e))
+                    wait = int(match.group(1)) + 2 if match else 15
+                    self._log(f"  [rate-limit] Waiting {wait}s before retry ({attempt + 1}/{max_attempts})...")
+                    time.sleep(wait)
+                else:
+                    raise
+        raise RuntimeError("Failed after retries due to rate limiting.")
+
     def run_tool_loop(
         self,
         system_prompt: str,
@@ -64,7 +80,7 @@ class LLMClient:
         final_text = ""
 
         for turn in range(1, max_turns + 1):
-            response = chat.send_message(message)
+            response = self._send_with_retry(chat, message)
             calls = response.function_calls or []
             text = response.text or ""
 
