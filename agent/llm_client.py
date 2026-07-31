@@ -1,7 +1,8 @@
 """
 Wrapper around the Google Gemini API (new google-genai SDK) implementing the
 same tool-use loop interface as the original Anthropic client, so core.py /
-main.py don't need any changes. Includes automatic retry on rate limits.
+main.py don't need any changes. Includes automatic retry on rate limits for
+both tool-calling and single-shot completions.
 """
 from __future__ import annotations
 
@@ -48,16 +49,19 @@ class LLMClient:
         ]
         return [types.Tool(function_declarations=declarations)]
 
+    def _wait_for_rate_limit(self, error: Exception, attempt: int, max_attempts: int) -> None:
+        match = re.search(r"retryDelay['\"]?:\s*['\"]?(\d+)", str(error))
+        wait = int(match.group(1)) + 2 if match else 15
+        self._log(f"  [rate-limit] Waiting {wait}s before retry ({attempt + 1}/{max_attempts})...")
+        time.sleep(wait)
+
     def _send_with_retry(self, chat, message, max_attempts: int = 5):
         for attempt in range(max_attempts):
             try:
                 return chat.send_message(message)
             except Exception as e:  # noqa: BLE001
                 if "RESOURCE_EXHAUSTED" in str(e) or "429" in str(e):
-                    match = re.search(r"retryDelay['\"]?:\s*['\"]?(\d+)", str(e))
-                    wait = int(match.group(1)) + 2 if match else 15
-                    self._log(f"  [rate-limit] Waiting {wait}s before retry ({attempt + 1}/{max_attempts})...")
-                    time.sleep(wait)
+                    self._wait_for_rate_limit(e, attempt, max_attempts)
                 else:
                     raise
         raise RuntimeError("Failed after retries due to rate limiting.")
@@ -111,10 +115,19 @@ class LLMClient:
 
     def complete(self, system_prompt: str, user_prompt: str, max_tokens: int = 4096) -> str:
         config = types.GenerateContentConfig(system_instruction=system_prompt)
-        response = self.client.models.generate_content(
-            model=self.model_name, contents=user_prompt, config=config
-        )
-        return response.text
+        max_attempts = 5
+        for attempt in range(max_attempts):
+            try:
+                response = self.client.models.generate_content(
+                    model=self.model_name, contents=user_prompt, config=config
+                )
+                return response.text
+            except Exception as e:  # noqa: BLE001
+                if "RESOURCE_EXHAUSTED" in str(e) or "429" in str(e):
+                    self._wait_for_rate_limit(e, attempt, max_attempts)
+                else:
+                    raise
+        raise RuntimeError("Failed after retries due to rate limiting.")
 
 
 def _short(d: dict) -> str:
